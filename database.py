@@ -1,23 +1,25 @@
 # database.py
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
 
-# BÌNH LUẬN LẠI DÒNG POSTGRESQL GÂY LỖI:
-# SQLALCHEMY_DATABASE_URL = "postgresql://postgres:mysecretpassword@localhost:5432/user_db"
+# Get individual database configuration from environment variables
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "mysecretpassword")
+DB_HOST = os.getenv("DB_HOST", "localhost")  # Changed from "localhost" to "db" for Docker Compose
+DB_PORT = os.getenv("DB_PORT", "5432")
+DB_NAME = os.getenv("DB_NAME", "user_db")
 
-# SỬ DỤNG DÒNG SQLITE NÀY THAY THẾ:
-SQLALCHEMY_DATABASE_URL = "postgresql://postgres:@localhost:5432/user_db"  # Sẽ tạo file user.db
+# Build the database URL
+SQLALCHEMY_DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL,    
-    #connect_args={"check_same_thread": False} # Bắt buộc cho SQLite
-)
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
 
-# Dependency Injection
 def get_db():
     db = SessionLocal()
     try:

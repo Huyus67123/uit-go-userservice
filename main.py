@@ -1,26 +1,15 @@
-'''
-        Code → Venv → Pip Install → Uvicorn Run → Test (Docs/Postman) → (Lặp lại)
-
-        python -m venv venv
-
-        .venv\Scripts\activate       
-
-        uvicorn main:app --reload
-'''
-
-
 # main.py
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Security
 from sqlalchemy.orm import Session
 from typing import List
 from uuid import UUID
 
 # --- 1. Import các tệp cho CSDL User ---
-# Đây là các tệp .py khác mà bạn tạo (models.py, schemas.py, crud.py)
 import crud
 import models
 import schemas
-from database import SessionLocal, engine, get_db # Import từ database.py (bản SQLite hoặc PostgreSQL)
+from database import SessionLocal, engine, get_db
+from auth import verify_firebase_token, get_current_user_uid  # <-- THÊM IMPORT
 
 # --- 2. Tạo các bảng CSDL (User, DriverProfile, Vehicle) ---
 # Nó sẽ đọc các class trong 'models.py' và tạo bảng trong file .db hoặc PostgreSQL
@@ -28,84 +17,155 @@ models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# --- 3. API Endpoints cho USER ---
+# --- 3. API Endpoints cho USER (with Firebase Auth) ---
 
 @app.post("/users/", response_model=schemas.User, status_code=status.HTTP_201_CREATED)
-def create_new_user(user: schemas.UserCreate, db: Session = Depends(get_db)):
+def create_new_user(
+    user: schemas.UserCreate, 
+    db: Session = Depends(get_db),
+    firebase_user: dict = Security(verify_firebase_token)  # <-- THÊM AUTHENTICATION
+):
     """
-    Tạo một user mới (không có mật khẩu).
+    Tạo một user mới (với Firebase authentication).
     """
+    # Verify firebase_uid matches token
+    if user.firebase_uid != firebase_user.get("uid"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Firebase UID does not match authenticated user"
+        )
+    
     db_user = crud.get_user_by_email(db, email=user.email)
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
-    # Gọi hàm 'crud.py' để tạo user
     return crud.create_user(db=db, user=user)
 
 
 @app.get("/users/", response_model=List[schemas.User])
-def read_all_users(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+def read_all_users(
+    skip: int = 0, 
+    limit: int = 100, 
+    db: Session = Depends(get_db),
+    current_user_uid: str = Security(get_current_user_uid)  # <-- THÊM AUTHENTICATION
+):
     """
-    Lấy danh sách tất cả user (response không chứa mật khẩu).
+    Lấy danh sách tất cả user (requires authentication).
     """
     users = crud.get_users(db, skip=skip, limit=limit)
     return users
 
 
 @app.get("/users/{user_id}", response_model=schemas.User)
-def read_one_user(user_id: UUID, db: Session = Depends(get_db)):
+def read_one_user(
+    user_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user_uid: str = Security(get_current_user_uid)  # <-- THÊM AUTHENTICATION
+):
     """
-    Lấy thông tin một user (response không chứa mật khẩu).
+    Lấy thông tin một user (requires authentication).
     """
     db_user = crud.get_user(db, user_id=user_id)
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    # Optional: Check if user can only access their own data
+    # if db_user.firebase_uid != current_user_uid:
+    #     raise HTTPException(status_code=403, detail="Access denied")
+    
     return db_user
 
-@app.put("/users/{user_id}", response_model=schemas.User)
-def update_existing_user(user_id: UUID, user_in: schemas.UserUpdate, db: Session = Depends(get_db)):
+@app.get("/users/?firebase_uid={firebase_uid}/", response_model=schemas.User)
+def read_one_user_by_firebase_uid(
+        firebase_uid: str,
+        db: Session = Depends(get_db),
+        current_user_uid: str = Security(get_current_user_uid)
+):
     """
-    Cập nhật thông tin một user (PUT thực ra là PATCH).
+    Lấy thông tin một user bằng firebase uid (requires authentication).
     """
-    db_user = crud.update_user(db, user_id=user_id, user_in=user_in)
+    if firebase_uid != current_user_uid:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Cannot access other user's data"
+        )
+
+    db_user = crud.get_user_by_firebase_uid(db, firebase_uid=firebase_uid)
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
+    return db_user
+
+
+@app.put("/users/{user_id}", response_model=schemas.User)
+def update_existing_user(
+    user_id: UUID, 
+    user_in: schemas.UserUpdate, 
+    db: Session = Depends(get_db),
+    current_user_uid: str = Security(get_current_user_uid)  # <-- THÊM AUTHENTICATION
+):
+    """
+    Cập nhật thông tin một user (requires authentication).
+    """
+    db_user = crud.get_user(db, user_id=user_id)
+    if db_user is None:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Verify user can only update their own data
+    if db_user.firebase_uid != current_user_uid:
+        raise HTTPException(status_code=403, detail="Cannot update other user's data")
+    
+    db_user = crud.update_user(db, user_id=user_id, user_in=user_in)
     return db_user
 
 
 @app.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_existing_user(user_id: UUID, db: Session = Depends(get_db)):
+def delete_existing_user(
+    user_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user_uid: str = Security(get_current_user_uid)  # <-- THÊM AUTHENTICATION
+):
     """
-    Xóa một user.
+    Xóa một user (requires authentication).
     """
-    db_user = crud.delete_user(db, user_id=user_id)
+    db_user = crud.get_user(db, user_id=user_id)
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
-    return # Trả về 204 No Content
-
-
+    
+    # Verify user can only delete their own account
+    if db_user.firebase_uid != current_user_uid:
+        raise HTTPException(status_code=403, detail="Cannot delete other user's account")
+    
+    crud.delete_user(db, user_id=user_id)
+    return
 
 #----- Driver Profile Endpoints -----
 @app.post("/users/{user_id}/driver-profile/", response_model=schemas.DriverProfile, status_code=status.HTTP_201_CREATED)
 def create_driver_profile_for_user(
     user_id: UUID, 
     profile: schemas.DriverProfileCreate, 
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user_uid: str = Security(get_current_user_uid)  # <-- THÊM AUTHENTICATION
 ):
     """
-    Tạo một hồ sơ tài xế cho một user đã tồn tại.
+    Tạo một hồ sơ tài xế cho một user đã tồn tại (requires authentication).
     """
     db_user = crud.get_user(db, user_id=user_id)
     if db_user is None:
         raise HTTPException(status_code=404, detail="User not found")
     
-    # (Thêm logic kiểm tra user đã có profile chưa...)
+    # Verify user can only create profile for themselves
+    if db_user.firebase_uid != current_user_uid:
+        raise HTTPException(status_code=403, detail="Cannot create profile for other users")
     
     return crud.create_driver_profile(db=db, profile=profile, user_id=user_id)
 
 @app.get("/users/{user_id}/driver-profile/", response_model=schemas.DriverProfile)
-def read_driver_profile_by_user(user_id: UUID, db: Session = Depends(get_db)):
+def read_driver_profile_by_user(
+    user_id: UUID, 
+    db: Session = Depends(get_db),
+    current_user_uid: str = Security(get_current_user_uid)  # <-- THÊM AUTHENTICATION
+):
     """
-    Lấy hồ sơ tài xế bằng ID của user.
+    Lấy hồ sơ tài xế bằng ID của user (requires authentication).
     """
     db_profile = crud.get_driver_profile_by_user_id(db, user_id=user_id)
     if db_profile is None:
@@ -215,4 +275,4 @@ def delete_existing_vehicle(vehicle_id: UUID, db: Session = Depends(get_db)):
     db_vehicle = crud.delete_vehicle(db, vehicle_id=vehicle_id)
     if db_vehicle is None:
         raise HTTPException(status_code=404, detail="Vehicle not found")
-    return  
+    return
